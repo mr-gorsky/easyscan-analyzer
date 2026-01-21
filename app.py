@@ -56,7 +56,7 @@ def detect_optic_disc(img):
     (cx, cy), r = cv2.minEnclosingCircle(disc)
 
     h, w = g.shape
-    if abs(cx - w/2) < w*0.15 and abs(cy - h/2) < h*0.15:
+    if abs(cx - w/2) < w*0.08 and abs(cy - h/2) < h*0.08:
         return None  # central → not disc
 
     return {"center": (int(cx), int(cy)), "radius": int(r), "contour": disc}
@@ -192,3 +192,4 @@ if st.button("🔬 Analyze Eye"):
 
     if "macula" in res:
         st.metric("Foveal reflex (IR central)", f"{res['macula']['foveal_reflex']:.1f}")
+

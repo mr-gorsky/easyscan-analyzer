@@ -10,228 +10,185 @@ import base64
 # PAGE SETUP
 # ======================================================
 st.set_page_config(
-    page_title="EasyScan SLO Analyzer – Advanced",
+    page_title="EasyScan SLO Analyzer (Clinical)",
     page_icon="👁️",
     layout="wide"
 )
 
-st.title("👁️ EasyScan Advanced SLO Analyzer")
-st.caption("Clinical-grade structural analysis for i-Optics EasyScan SLO")
+st.title("👁️ EasyScan SLO Analyzer – Clinical Mode")
+st.caption("Structured analysis for i-Optics EasyScan (6-image protocol per eye)")
 
 # ======================================================
-# PREPROCESSING (SLO IR)
+# UTILITIES
 # ======================================================
-def preprocess(img):
+def to_gray(img):
     if img.ndim == 3:
         img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
-    img = cv2.GaussianBlur(img, (7, 7), 0)
-    return img
+    return cv2.GaussianBlur(img, (7, 7), 0)
 
 # ======================================================
-# DISC + CUP
+# OPTIC DISC (NASAL ONLY)
 # ======================================================
-def detect_disc_cup(img):
-    g = preprocess(img)
+def detect_optic_disc(img):
+    g = to_gray(img)
 
-    _, disc_bin = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    disc_bin = cv2.morphologyEx(disc_bin, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
+    _, bin = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bin = cv2.morphologyEx(bin, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
 
-    cnts, _ = cv2.findContours(disc_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts, _ = cv2.findContours(bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    valid = []
+
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if not (4000 < area < 60000):
+            continue
+        peri = cv2.arcLength(c, True)
+        circ = 4 * np.pi * area / (peri ** 2)
+        if circ < 0.6:
+            continue
+        valid.append(c)
+
+    if not valid:
+        return None
+
+    disc = max(valid, key=cv2.contourArea)
+    (cx, cy), r = cv2.minEnclosingCircle(disc)
+
+    h, w = g.shape
+    if abs(cx - w/2) < w*0.15 and abs(cy - h/2) < h*0.15:
+        return None  # central → not disc
+
+    return {"center": (int(cx), int(cy)), "radius": int(r), "contour": disc}
+
+# ======================================================
+# CUP
+# ======================================================
+def detect_cup(g, disc):
+    cx, cy = disc["center"]
+    r = disc["radius"]
+
+    mask = np.zeros_like(g)
+    cv2.circle(mask, (cx, cy), r, 255, -1)
+    roi = cv2.bitwise_and(g, g, mask=mask)
+
+    thr = np.mean(roi[mask > 0]) + 0.3*np.std(roi[mask > 0])
+    _, cup_bin = cv2.threshold(roi, thr, 255, cv2.THRESH_BINARY)
+    cup_bin = cv2.morphologyEx(cup_bin, cv2.MORPH_OPEN, np.ones((9,9), np.uint8))
+
+    cnts, _ = cv2.findContours(cup_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
 
-    disc_cnt = max(cnts, key=cv2.contourArea)
-    (cx, cy), disc_r = cv2.minEnclosingCircle(disc_cnt)
+    (_, _), cr = cv2.minEnclosingCircle(max(cnts, key=cv2.contourArea))
+    return int(cr)
 
-    mask = np.zeros_like(g)
-    cv2.circle(mask, (int(cx), int(cy)), int(disc_r), 255, -1)
-    roi = cv2.bitwise_and(g, g, mask=mask)
+# ======================================================
+# MACULA (CENTRAL ONLY)
+# ======================================================
+def detect_macula(img):
+    g = to_gray(img)
+    h, w = g.shape
+    cx, cy = w//2, h//2
 
-    cup_thr = np.mean(roi[mask > 0]) + 0.3 * np.std(roi[mask > 0])
-    _, cup_bin = cv2.threshold(roi, cup_thr, 255, cv2.THRESH_BINARY)
-    cup_bin = cv2.morphologyEx(cup_bin, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
-
-    cnts, _ = cv2.findContours(cup_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cup_r = disc_r * 0.4
-    if cnts:
-        (_, _), cup_r = cv2.minEnclosingCircle(max(cnts, key=cv2.contourArea))
-
-    cd = float(cup_r / disc_r)
-
-    ellipse = cv2.fitEllipse(disc_cnt)
-    axis_ratio = max(ellipse[1]) / min(ellipse[1])
+    roi = g[cy-100:cy+100, cx-100:cx+100]
+    reflex = np.mean(roi)
 
     return {
-        "center": (int(cx), int(cy)),
-        "disc_radius": int(disc_r),
-        "cup_radius": int(cup_r),
-        "cd_ratio": cd,
-        "axis_ratio": axis_ratio
+        "center": (cx, cy),
+        "foveal_reflex": reflex
     }
 
 # ======================================================
-# ISNT RULE
-# ======================================================
-def isnt_rule(vessel_map, center):
-    cx, cy = center
-    h, w = vessel_map.shape
-
-    regions = {
-        "I": vessel_map[cy:h, cx-50:cx+50],
-        "S": vessel_map[0:cy, cx-50:cx+50],
-        "N": vessel_map[cy-50:cy+50, 0:cx],
-        "T": vessel_map[cy-50:cy+50, cx:w],
-    }
-
-    density = {k: np.sum(v > 0) for k, v in regions.items()}
-    return density, density["I"] >= density["S"] >= density["N"] >= density["T"]
-
-# ======================================================
-# VESSELS + AV
+# VESSELS
 # ======================================================
 def segment_vessels(img):
-    g = preprocess(img)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    bh = cv2.morphologyEx(g, cv2.MORPH_BLACKHAT, kernel)
-    _, vbin = cv2.threshold(bh, np.percentile(bh, 90), 255, cv2.THRESH_BINARY)
-    return cv2.morphologyEx(vbin, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    g = to_gray(img)
+    bh = cv2.morphologyEx(g, cv2.MORPH_BLACKHAT,
+                          cv2.getStructuringElement(cv2.MORPH_RECT, (15,15)))
+    _, v = cv2.threshold(bh, np.percentile(bh, 90), 255, cv2.THRESH_BINARY)
+    return cv2.morphologyEx(v, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
 
-def av_ratio(vbin):
-    dist = cv2.distanceTransform(vbin, cv2.DIST_L2, 5)
-    widths = dist[vbin > 0] * 2
-    if len(widths) < 50:
+def av_ratio(v):
+    dist = cv2.distanceTransform(v, cv2.DIST_L2, 5)
+    w = dist[v > 0] * 2
+    if len(w) < 100:
         return None
-
-    med = np.median(widths)
-    a = np.mean(widths[widths < med])
-    v = np.mean(widths[widths >= med])
-    frac = Fraction(int(a), int(v)).limit_denominator()
-
-    return {
-        "av": float(a / v),
-        "fraction": f"{frac.numerator}/{frac.denominator}"
-    }
+    med = np.median(w)
+    a, ve = np.mean(w[w < med]), np.mean(w[w >= med])
+    frac = Fraction(int(a), int(ve)).limit_denominator()
+    return {"ratio": a/ve, "fraction": f"{frac.numerator}/{frac.denominator}"}
 
 # ======================================================
-# PPA + LESIONS
+# ANALYSIS PIPELINE
 # ======================================================
-def detect_ppa(g, disc):
-    cx, cy = disc["center"]
-    r = disc["disc_radius"]
-    ring = g[cy-r*2:cy+r*2, cx-r*2:cx+r*2]
-    return np.std(ring) > 25
+def analyze_eye(images):
+    results = {}
 
-def detect_lesions(g):
-    _, dark = cv2.threshold(g, 40, 255, cv2.THRESH_BINARY_INV)
-    _, bright = cv2.threshold(g, 200, 255, cv2.THRESH_BINARY)
-    return np.sum(dark > 0), np.sum(bright > 0)
+    # NASAL IR → DISC
+    if "IR_NASAL" in images:
+        g = to_gray(images["IR_NASAL"])
+        disc = detect_optic_disc(images["IR_NASAL"])
+        if disc:
+            cup_r = detect_cup(g, disc)
+            if cup_r:
+                cd = cup_r / disc["radius"]
+                results["C/D"] = cd
+                results["disc"] = disc
 
-# ======================================================
-# MAIN ANALYSIS
-# ======================================================
-def analyze(img):
-    g = preprocess(img)
-    disc = detect_disc_cup(img)
-    vessels = segment_vessels(img)
-    av = av_ratio(vessels)
+    # CENTRAL IR → MACULA
+    if "IR_CENTRAL" in images:
+        results["macula"] = detect_macula(images["IR_CENTRAL"])
 
-    findings = []
-    glaucoma_score = 0
+    # VESSELS (GREEN NASAL)
+    if "GREEN_NASAL" in images:
+        v = segment_vessels(images["GREEN_NASAL"])
+        results["AV"] = av_ratio(v)
+        results["vessel_map"] = v
 
-    if disc:
-        if disc["cd_ratio"] > 0.6:
-            findings.append("Enlarged C/D ratio")
-            glaucoma_score += 40
-        if disc["axis_ratio"] > 1.3:
-            findings.append("Tilted optic disc")
-            glaucoma_score += 10
-        if detect_ppa(g, disc):
-            findings.append("Peripapillary atrophy")
-            glaucoma_score += 15
-
-        density, isnt_ok = isnt_rule(vessels, disc["center"])
-        if not isnt_ok:
-            findings.append("ISNT rule violation")
-            glaucoma_score += 20
-
-    if av:
-        if av["av"] < 0.6:
-            findings.append("Arteriolar narrowing")
-            glaucoma_score += 10
-        elif av["av"] > 0.8:
-            findings.append("Venous dilation")
-
-    dark, bright = detect_lesions(g)
-    if dark > 500:
-        findings.append("Hemorrhage candidates")
-    if bright > 500:
-        findings.append("Hard exudate candidates")
-
-    glaucoma_score = min(100, glaucoma_score)
-
-    vis = cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)
-    if disc:
-        cx, cy = disc["center"]
-        cv2.circle(vis, (cx, cy), disc["disc_radius"], (0, 255, 0), 2)
-        cv2.circle(vis, (cx, cy), disc["cup_radius"], (255, 0, 0), 2)
-    vis[vessels > 0] = [255, 165, 0]
-
-    return {
-        "disc": disc,
-        "av": av,
-        "findings": findings,
-        "glaucoma_score": glaucoma_score,
-        "visualization": vis
-    }
+    return results
 
 # ======================================================
-# HTML REPORT
+# UPLOAD UI
 # ======================================================
-def generate_report(res):
-    html = f"""
-    <h1>EasyScan SLO Report</h1>
-    <p>Date: {datetime.now()}</p>
-    <h2>Optic Disc</h2>
-    <p>C/D ratio: {res['disc']['cd_ratio']:.2f}</p>
-    <h2>Vessels</h2>
-    <p>A/V ratio: {res['av']['av']:.2f} ({res['av']['fraction']})</p>
-    <h2>Glaucoma Risk Score</h2>
-    <h1>{res['glaucoma_score']}/100</h1>
-    <h2>Findings</h2>
-    """ + "".join(f"<li>{f}</li>" for f in res["findings"])
-    return html
+st.subheader("Upload images – one eye")
+
+labels = {
+    "IR_CENTRAL": "IR Central",
+    "GREEN_CENTRAL": "Green Central",
+    "MERGED_CENTRAL": "Merged Central",
+    "IR_NASAL": "IR Nasal",
+    "GREEN_NASAL": "Green Nasal",
+    "MERGED_NASAL": "Merged Nasal",
+}
+
+images = {}
+cols = st.columns(3)
+
+for i, (k, label) in enumerate(labels.items()):
+    with cols[i % 3]:
+        f = st.file_uploader(label, type=["tif", "tiff", "png", "jpg"], key=k)
+        if f:
+            images[k] = np.array(Image.open(f))
+            st.image(images[k], use_container_width=True)
 
 # ======================================================
-# UI
+# RUN
 # ======================================================
-uploaded = st.file_uploader("Upload i-Optics EasyScan SLO image", type=["tif", "tiff", "png", "jpg"])
+if st.button("🔬 Analyze Eye"):
+    res = analyze_eye(images)
 
-if uploaded:
-    img = np.array(Image.open(uploaded))
-    st.image(img, caption="Original SLO", use_container_width=True)
+    st.markdown("---")
+    st.subheader("Results")
 
-    if st.button("🔬 Run Advanced Analysis"):
-        with st.spinner("Analyzing..."):
-            res = analyze(img)
+    if "C/D" in res:
+        st.metric("C/D ratio (nasal)", f"{res['C/D']:.2f}")
+    else:
+        st.info("Optic disc not in field of view – C/D not calculated")
 
-        st.image(res["visualization"], caption="Analysis overlay", use_container_width=True)
+    if "AV" in res and res["AV"]:
+        st.metric("A/V ratio", f"{res['AV']['ratio']:.2f}")
+        st.caption(res["AV"]["fraction"])
 
-        st.metric("C/D ratio", f"{res['disc']['cd_ratio']:.2f}")
-        st.metric("Glaucoma Risk", f"{res['glaucoma_score']}/100")
-
-        if res["av"]:
-            st.metric("A/V ratio", f"{res['av']['av']:.2f}")
-            st.caption(res["av"]["fraction"])
-
-        st.subheader("Findings")
-        for f in res["findings"]:
-            st.warning(f)
-
-        if st.button("📄 Download HTML report"):
-            html = generate_report(res)
-            b64 = base64.b64encode(html.encode()).decode()
-            st.markdown(f"<a href='data:text/html;base64,{b64}' download='slo_report.html'>Download</a>", unsafe_allow_html=True)
-
-else:
-    st.info("Upload an EasyScan SLO image to start.")
+    if "macula" in res:
+        st.metric("Foveal reflex (IR central)", f"{res['macula']['foveal_reflex']:.1f}")

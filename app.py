@@ -1,7 +1,7 @@
 # ================================
-# EasyScan SLO Analyzer – FULL CLINICAL VERSION
-# Optimized for i-Optics EasyScan (IR / Green / Merged)
-# Central vs Nasal aware, HARD safety gates for C/D
+# EasyScan SLO Analyzer – DICOM-AWARE CLINICAL VERSION
+# Robust optic disc detection using acquisition metadata
+# Designed for i-Optics EasyScan (IR / Green / Merged)
 # ================================
 
 import streamlit as st
@@ -11,22 +11,34 @@ from PIL import Image
 from fractions import Fraction
 from datetime import datetime
 import base64
+import pydicom
 
 # ==================================================
 # PAGE SETUP
 # ==================================================
 st.set_page_config(
-    page_title="EasyScan SLO Analyzer (Clinical)",
+    page_title="EasyScan SLO Analyzer (Clinical, DICOM-aware)",
     page_icon="👁️",
     layout="wide"
 )
 
-st.title("👁️ EasyScan SLO Analyzer – Clinical Mode")
-st.caption("Designed for i-Optics EasyScan | 6-image protocol per eye")
+st.title("👁️ EasyScan SLO Analyzer – Clinical (DICOM-aware)")
+st.caption("Robust analysis for i-Optics EasyScan | Uses DICOM metadata when available")
 
 # ==================================================
-# BASIC IMAGE UTILS
+# IMAGE UTILS
 # ==================================================
+def load_image(file):
+    if file.name.lower().endswith('.dcm'):
+        ds = pydicom.dcmread(file)
+        img = ds.pixel_array.astype(np.float32)
+        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        return img, ds
+    else:
+        img = np.array(Image.open(file))
+        return img, None
+
+
 def to_gray(img):
     if img.ndim == 3:
         img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
@@ -34,25 +46,39 @@ def to_gray(img):
     return cv2.GaussianBlur(img, (7, 7), 0)
 
 # ==================================================
-# OPTIC DISC DETECTION (IR NASAL ONLY)
+# DISC DETECTION – DICOM GUIDED
 # ==================================================
-def detect_optic_disc_ir_nasal(img):
+def detect_optic_disc(img, ds=None):
     g = to_gray(img)
     h, w = g.shape
 
+    # ---- Use DICOM info if present
+    expected_side = None
+    if ds is not None:
+        desc = str(ds.get('SeriesDescription', '')).lower()
+        if 'nasal' in desc:
+            expected_side = 'nasal'
+        if 'central' in desc:
+            expected_side = 'central'
+
+    # ---- CLAHE for IR SLO
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     cl = clahe.apply(g)
 
-    # bright local blobs
-    _, bright = cv2.threshold(cl, np.percentile(cl, 97), 255, cv2.THRESH_BINARY)
-    bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    # ---- Gradient ring (disc has strong rim)
+    grad = cv2.Laplacian(cl, cv2.CV_32F)
+    grad = np.abs(grad)
+    grad = cv2.normalize(grad, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-    cnts, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    _, rim = cv2.threshold(grad, np.percentile(grad, 95), 255, cv2.THRESH_BINARY)
+    rim = cv2.morphologyEx(rim, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+
+    cnts, _ = cv2.findContours(rim, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates = []
 
     for c in cnts:
         area = cv2.contourArea(c)
-        if not (2000 < area < 50000):
+        if not (3000 < area < 70000):
             continue
 
         peri = cv2.arcLength(c, True)
@@ -60,45 +86,46 @@ def detect_optic_disc_ir_nasal(img):
             continue
 
         circ = 4 * np.pi * area / (peri ** 2)
-        if circ < 0.5:
+        if circ < 0.45:
             continue
 
         (cx, cy), r = cv2.minEnclosingCircle(c)
         center_dist = np.sqrt((cx - w/2)**2 + (cy - h/2)**2)
 
-        # MUST be off-center for nasal
-        if center_dist < 0.1 * min(w, h):
+        # ---- If central image, reject disc
+        if expected_side == 'central' and center_dist < 0.2 * min(w, h):
             continue
 
-        candidates.append((c, r))
+        candidates.append((c, r, center_dist))
 
     if not candidates:
         return None
 
-    disc_cnt, disc_r = max(candidates, key=lambda x: x[1])
+    # ---- Choose most eccentric strong candidate
+    disc_cnt, disc_r, _ = max(candidates, key=lambda x: (x[1], x[2]))
     (cx, cy), _ = cv2.minEnclosingCircle(disc_cnt)
 
     return {
-        "center": (int(cx), int(cy)),
-        "radius": int(disc_r),
-        "contour": disc_cnt
+        'center': (int(cx), int(cy)),
+        'radius': int(disc_r),
+        'contour': disc_cnt
     }
 
 # ==================================================
-# CUP DETECTION (INSIDE DISC)
+# CUP DETECTION
 # ==================================================
-def detect_cup_ir(img, disc):
+def detect_cup(img, disc):
     g = to_gray(img)
-    cx, cy = disc["center"]
-    r = disc["radius"]
+    cx, cy = disc['center']
+    r = disc['radius']
 
     mask = np.zeros_like(g)
     cv2.circle(mask, (cx, cy), r, 255, -1)
     roi = cv2.bitwise_and(g, g, mask=mask)
 
-    thr = np.mean(roi[mask > 0]) + 0.3 * np.std(roi[mask > 0])
+    thr = np.mean(roi[mask > 0]) + 0.25 * np.std(roi[mask > 0])
     _, cup_bin = cv2.threshold(roi, thr, 255, cv2.THRESH_BINARY)
-    cup_bin = cv2.morphologyEx(cup_bin, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
+    cup_bin = cv2.morphologyEx(cup_bin, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
 
     cnts, _ = cv2.findContours(cup_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
@@ -108,31 +135,16 @@ def detect_cup_ir(img, disc):
     return int(cr)
 
 # ==================================================
-# MACULA (CENTRAL ONLY)
+# VESSELS (GREEN)
 # ==================================================
-def detect_macula_ir_central(img):
-    g = to_gray(img)
-    h, w = g.shape
-    cx, cy = w // 2, h // 2
-    roi = g[cy-100:cy+100, cx-100:cx+100]
-    return {
-        "center": (cx, cy),
-        "foveal_reflex": float(np.mean(roi))
-    }
-
-# ==================================================
-# VESSEL SEGMENTATION (GREEN)
-# ==================================================
-def segment_vessels_green(img):
+def segment_vessels(img):
     g = to_gray(img)
     bh = cv2.morphologyEx(g, cv2.MORPH_BLACKHAT,
                           cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
     _, v = cv2.threshold(bh, np.percentile(bh, 90), 255, cv2.THRESH_BINARY)
     return cv2.morphologyEx(v, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
-# ==================================================
-# A/V RATIO
-# ==================================================
+
 def compute_av_ratio(vessel_bin):
     dist = cv2.distanceTransform(vessel_bin, cv2.DIST_L2, 5)
     widths = dist[vessel_bin > 0] * 2
@@ -146,88 +158,52 @@ def compute_av_ratio(vessel_bin):
 
     frac = Fraction(int(a), int(v)).limit_denominator()
     return {
-        "ratio": float(a / v),
-        "fraction": f"{frac.numerator}/{frac.denominator}"
+        'ratio': float(a / v),
+        'fraction': f"{frac.numerator}/{frac.denominator}"
     }
 
 # ==================================================
-# ANALYZE ONE EYE
+# ANALYSIS PIPELINE
 # ==================================================
-def analyze_eye(images):
-    results = {}
+def analyze_image(file):
+    img, ds = load_image(file)
 
-    # ---- NASAL IR → DISC + CUP
-    if "IR_NASAL" in images:
-        disc = detect_optic_disc_ir_nasal(images["IR_NASAL"])
-        if disc:
-            cup_r = detect_cup_ir(images["IR_NASAL"], disc)
-            if cup_r:
-                results["cd_ratio"] = cup_r / disc["radius"]
-                results["disc"] = disc
+    disc = detect_optic_disc(img, ds)
+    result = {}
 
-    # ---- CENTRAL IR → MACULA
-    if "IR_CENTRAL" in images:
-        results["macula"] = detect_macula_ir_central(images["IR_CENTRAL"])
+    if disc:
+        cup_r = detect_cup(img, disc)
+        if cup_r:
+            result['cd_ratio'] = cup_r / disc['radius']
+            result['disc'] = disc
 
-    # ---- GREEN NASAL → VESSELS + AV
-    if "GREEN_NASAL" in images:
-        v = segment_vessels_green(images["GREEN_NASAL"])
-        results["av"] = compute_av_ratio(v)
-        results["vessel_map"] = v
-
-    return results
+    return img, result
 
 # ==================================================
-# UPLOAD UI (6 IMAGES)
+# UI
 # ==================================================
-st.subheader("Upload images – ONE EYE (OD or OS)")
+st.subheader("Upload IR NASAL image (DICOM preferred)")
 
-labels = {
-    "IR_CENTRAL": "IR Central",
-    "GREEN_CENTRAL": "Green Central",
-    "MERGED_CENTRAL": "Merged Central",
-    "IR_NASAL": "IR Nasal",
-    "GREEN_NASAL": "Green Nasal",
-    "MERGED_NASAL": "Merged Nasal",
-}
+file = st.file_uploader("IR Nasal (DICOM .dcm or TIFF)", type=['dcm', 'tif', 'tiff', 'png', 'jpg'])
 
-images = {}
-cols = st.columns(3)
+if file:
+    img, res = analyze_image(file)
 
-for i, (k, label) in enumerate(labels.items()):
-    with cols[i % 3]:
-        f = st.file_uploader(label, type=["tif", "tiff", "png", "jpg"], key=k)
-        if f:
-            images[k] = np.array(Image.open(f))
-            st.image(images[k], use_container_width=True)
+    st.image(img, caption="Input image", use_container_width=True)
 
-# ==================================================
-# RUN ANALYSIS
-# ==================================================
-if st.button("🔬 Analyze Eye"):
-    res = analyze_eye(images)
-
-    st.markdown("---")
+    st.markdown('---')
     st.subheader("Results")
 
-    if "cd_ratio" in res:
-        st.metric("C/D ratio (IR nasal)", f"{res['cd_ratio']:.2f}")
+    if 'cd_ratio' in res:
+        st.metric("C/D ratio", f"{res['cd_ratio']:.2f}")
     else:
-        st.info("Optic disc not confidently detected on IR nasal – C/D not calculated")
+        st.warning("Optic disc not confidently detected – C/D not calculated")
 
-    if "av" in res and res["av"]:
-        st.metric("A/V ratio", f"{res['av']['ratio']:.2f}")
-        st.caption(res['av']['fraction'])
-
-    if "macula" in res:
-        st.metric("Foveal reflex (IR central)", f"{res['macula']['foveal_reflex']:.1f}")
-
-    # ---- VISUAL DEBUG OVERLAY
-    if "disc" in res and "IR_NASAL" in images:
-        vis = cv2.cvtColor(to_gray(images["IR_NASAL"]), cv2.COLOR_GRAY2RGB)
-        cx, cy = res["disc"]["center"]
-        cv2.circle(vis, (cx, cy), res["disc"]["radius"], (0, 255, 0), 2)
-        st.image(vis, caption="IR Nasal – Optic Disc Detected", use_container_width=True)
+    if 'disc' in res:
+        vis = cv2.cvtColor(to_gray(img), cv2.COLOR_GRAY2RGB)
+        cx, cy = res['disc']['center']
+        cv2.circle(vis, (cx, cy), res['disc']['radius'], (0, 255, 0), 2)
+        st.image(vis, caption="Detected optic disc", use_container_width=True)
 
 else:
-    st.info("Upload EasyScan images to begin analysis")
+    st.info("Upload an IR nasal image to begin")
